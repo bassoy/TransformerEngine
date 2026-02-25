@@ -100,6 +100,7 @@ def cross_entropy_kernel(
     n_non_ignore,
     reduce_loss: tl.constexpr,
     label_smoothing: tl.constexpr,
+    z_loss_weight: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -121,6 +122,9 @@ def cross_entropy_kernel(
     n_rows (int): The number of rows in the batch (B * SQ), used for buffer indexing.
     n_non_ignore: The number of non-ignored elements in the batch.
     label_smoothing (float): The amount of smoothing when computing the loss, where 0.0 means no smoothing.
+    z_loss_weight (float): Weight for z-loss regularization on output logits.
+        When > 0, adds z_loss_weight * log(sum(exp(logits)))^2 per token to the loss.
+        When 0.0, all z-loss logic is dead-code-eliminated by Triton.
     BLOCK_SIZE (int): The block size for Triton operations.
     """
 
@@ -160,6 +164,11 @@ def cross_entropy_kernel(
         m = tl.maximum(m, m_new)
         ori_X_y = tl.maximum(ori_X_y, X_y_new)
 
+    # Compute log-sum-exp and z-loss gradient scale
+    if z_loss_weight > 0:
+        lse = m + tl.log(d)
+        z_grad_scale = 2.0 * z_loss_weight * lse
+
     # Label smoothing is a general case of normal cross entropy
     scaled_x_sum = 0.0
     eps = label_smoothing / (n_cols * world_size)
@@ -180,13 +189,19 @@ def cross_entropy_kernel(
         if label_smoothing > 0:
             # scale X beforehand to avoid overflow
             scaled_x_sum += tl.sum(tl.where(X_offsets < n_cols, -eps * X_block, 0.0))
+        # Compute softmax and apply z-loss scaling
+        # d(z_loss)/d(x_i) = 2 * w * lse * softmax(x_i)
+        # Combined gradient: softmax(x_i) * (1 + 2*w*lse) - eps
+        softmax_block = tl.exp(X_block - m) / d
+        if z_loss_weight > 0:
+            softmax_block = softmax_block * (1.0 + z_grad_scale)
         # Scale gradients based on reduction mode
         # For reduce_loss=True: PyTorch will scale by 1/n_rows, so we need to scale by n_rows/n_non_ignore
         # For reduce_loss=False: No additional scaling from PyTorch, so we don't scale here
         if reduce_loss:
-            X_block = (tl.exp(X_block - m) / d - eps) / (n_non_ignore)
+            X_block = (softmax_block - eps) / (n_non_ignore)
         else:
-            X_block = tl.exp(X_block - m) / d - eps
+            X_block = softmax_block - eps
         tl.store(X_ptr + X_offsets, X_block.to(grad_dtype), mask=X_offsets < n_cols)
 
     # We need tl.debug_barrier() to ensure the new result of X_ptr is written
@@ -207,6 +222,10 @@ def cross_entropy_kernel(
     if label_smoothing > 0:
         smooth_loss = scaled_x_sum + label_smoothing * (m + tl.log(d))
         loss = loss * (1 - label_smoothing) + smooth_loss
+
+    # Add z-loss: z_loss_weight * lse^2
+    if z_loss_weight > 0:
+        loss += z_loss_weight * lse * lse
 
     # 6. Specially handle the i==y case where `dx_y = (softmax(x_y) - (1 - label_smoothing) / N`
     vocab_start_idx = rank * n_cols

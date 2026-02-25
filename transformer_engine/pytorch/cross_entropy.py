@@ -33,6 +33,7 @@ class CrossEntropyFunction(torch.autograd.Function):
         dist_process_group=None,
         ignore_idx=-100,
         is_cg_capturable=False,
+        z_loss_weight=0.0,
     ):
         """
         The forward pass of the Cross Entropy loss. If dist_process_group is passed for distributed loss calculation, the input to each
@@ -46,6 +47,7 @@ class CrossEntropyFunction(torch.autograd.Function):
         reduce_loss (bool): If true, returns the averaged loss across the B*SQ dimension.
         dist_process_group (torch.dist.ProcessGroup): The distributed process group the loss computation is split across, None if on 1 device.
         ignore_idx (int): The index for which loss and gradients are made to zero
+        z_loss_weight (float): Weight for z-loss regularization on output logits.
 
         Returns:
         tensor: The computed loss.
@@ -57,6 +59,7 @@ class CrossEntropyFunction(torch.autograd.Function):
             reduce_loss,
             dist_process_group,
             ignore_idx,
+            z_loss_weight,
         )
 
         ctx.save_for_backward(inp.detach())
@@ -85,6 +88,7 @@ class CrossEntropyFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -96,6 +100,7 @@ def parallel_cross_entropy(
     dist_process_group: Optional[torch.distributed.ProcessGroup] = None,
     ignore_idx: int = -100,
     is_cg_capturable: bool = False,
+    z_loss_weight: float = 0.0,
     *,
     _input: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -127,6 +132,10 @@ def parallel_cross_entropy(
         The index for which loss and gradients are made to zero.
     is_cg_capturable : bool, default = False
         Whether the operation is CUDA graph capturable.
+    z_loss_weight : float, default = 0.0
+        Weight for z-loss regularization on output logits.
+        When > 0, adds ``z_loss_weight * log(sum(exp(logits)))^2`` per token to the loss.
+        This stabilizes training by preventing logit magnitudes from growing unboundedly.
 
     Returns
     -------
@@ -149,4 +158,5 @@ def parallel_cross_entropy(
         dist_process_group,
         ignore_idx,
         is_cg_capturable,
+        z_loss_weight,
     )

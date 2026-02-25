@@ -4,6 +4,7 @@
 
 import random
 import torch
+import torch.nn.functional as F
 from transformer_engine.pytorch import parallel_cross_entropy
 
 from utils import dtype_tols
@@ -166,4 +167,179 @@ class TestParallelCrossEntropy:
                 label_smoothing=0,
                 reduce_loss=True,
                 ignore_idx=True,
+            )
+
+    def test_z_loss(self):
+        """Test basic z-loss correctness: CE(mean) + z_loss_weight * mean(lse^2)"""
+        z_loss_weight = 1e-4
+        tols = dtype_tols(torch.float32)
+
+        for _ in range(3):
+            B, SQ = 2, 64
+            V = random.choice([64000, 128000])
+
+            inp_test = torch.rand((B, SQ, V), dtype=torch.float32, device="cuda")
+            tar_test = torch.randint(0, V, (B, SQ), device="cuda")
+
+            inp_ref = inp_test.clone().detach().reshape(B * SQ, V)
+            tar_ref = tar_test.clone().detach().reshape(B * SQ)
+
+            inp_test.requires_grad_()
+            inp_ref.requires_grad_()
+
+            # Test: Triton with z-loss
+            test_loss = parallel_cross_entropy(
+                inp_test, tar_test, reduce_loss=True, z_loss_weight=z_loss_weight,
+            )
+
+            # Reference: PyTorch CE + manual z-loss
+            ce_loss = F.cross_entropy(inp_ref, tar_ref, reduction="mean")
+            lse = torch.logsumexp(inp_ref, dim=-1)
+            ref_z_loss = z_loss_weight * (lse ** 2).mean()
+            ref_loss = ce_loss + ref_z_loss
+
+            torch.testing.assert_close(
+                test_loss.to(torch.float64, device="cpu"),
+                ref_loss.to(torch.float64, device="cpu"),
+                **tols,
+            )
+
+            test_loss.backward()
+            ref_loss.backward()
+
+            test_grad = inp_test.grad.to(torch.float64, device="cpu")
+            ref_grad = inp_ref.grad.to(torch.float64, device="cpu").reshape(test_grad.shape)
+            torch.testing.assert_close(test_grad, ref_grad, **tols)
+
+    def test_z_loss_with_label_smoothing(self):
+        """Test z-loss + label smoothing composition"""
+        z_loss_weight = 1e-4
+        label_smoothing = 0.1
+        tols = dtype_tols(torch.float32)
+
+        for _ in range(3):
+            B, SQ = 2, 64
+            V = random.choice([64000, 128000])
+
+            inp_test = torch.rand((B, SQ, V), dtype=torch.float32, device="cuda")
+            tar_test = torch.randint(0, V, (B, SQ), device="cuda")
+
+            inp_ref = inp_test.clone().detach().reshape(B * SQ, V)
+            tar_ref = tar_test.clone().detach().reshape(B * SQ)
+
+            inp_test.requires_grad_()
+            inp_ref.requires_grad_()
+
+            # Test
+            test_loss = parallel_cross_entropy(
+                inp_test, tar_test,
+                label_smoothing=label_smoothing,
+                reduce_loss=True,
+                z_loss_weight=z_loss_weight,
+            )
+
+            # Reference
+            ce_loss = F.cross_entropy(
+                inp_ref, tar_ref, reduction="mean", label_smoothing=label_smoothing,
+            )
+            lse = torch.logsumexp(inp_ref, dim=-1)
+            ref_loss = ce_loss + z_loss_weight * (lse ** 2).mean()
+
+            torch.testing.assert_close(
+                test_loss.to(torch.float64, device="cpu"),
+                ref_loss.to(torch.float64, device="cpu"),
+                **tols,
+            )
+
+            test_loss.backward()
+            ref_loss.backward()
+
+            test_grad = inp_test.grad.to(torch.float64, device="cpu")
+            ref_grad = inp_ref.grad.to(torch.float64, device="cpu").reshape(test_grad.shape)
+            torch.testing.assert_close(test_grad, ref_grad, **tols)
+
+    def test_z_loss_with_ignore_idx(self):
+        """Test z-loss with ignored tokens: ignored tokens get zero gradients"""
+        z_loss_weight = 1e-4
+        tols = dtype_tols(torch.float32)
+
+        for _ in range(3):
+            B, SQ = 1, 128
+            V = 64000
+            ignore_positions = random.sample(range(SQ), 5)
+
+            inp_test = torch.rand((B, SQ, V), dtype=torch.float32, device="cuda")
+            tar_test = torch.randint(0, V, (B, SQ), device="cuda")
+            for pos in ignore_positions:
+                tar_test[0, pos] = -100
+
+            inp_ref = inp_test.clone().detach().reshape(B * SQ, V)
+            tar_ref = tar_test.clone().detach().reshape(B * SQ)
+
+            inp_test.requires_grad_()
+            inp_ref.requires_grad_()
+
+            # Test
+            test_loss = parallel_cross_entropy(
+                inp_test, tar_test, reduce_loss=True,
+                ignore_idx=-100, z_loss_weight=z_loss_weight,
+            )
+
+            # Reference: manually compute masked CE + masked z-loss
+            mask = tar_ref != -100
+            n_valid = mask.sum().float()
+            ce_loss = F.cross_entropy(inp_ref, tar_ref, ignore_index=-100, reduction="mean")
+            lse = torch.logsumexp(inp_ref, dim=-1)
+            ref_z_loss = z_loss_weight * (lse[mask] ** 2).sum() / n_valid
+            ref_loss = ce_loss + ref_z_loss
+
+            torch.testing.assert_close(
+                test_loss.to(torch.float64, device="cpu"),
+                ref_loss.to(torch.float64, device="cpu"),
+                **tols,
+            )
+
+            test_loss.backward()
+            ref_loss.backward()
+
+            test_grad = inp_test.grad.to(torch.float64, device="cpu")
+            ref_grad = inp_ref.grad.to(torch.float64, device="cpu").reshape(test_grad.shape)
+            torch.testing.assert_close(test_grad, ref_grad, **tols)
+
+            # Verify ignored tokens have zero gradients
+            for pos in ignore_positions:
+                assert torch.all(
+                    inp_test.grad[0, pos] == 0
+                ), f"Ignored position {pos} should have zero gradients"
+
+    def test_z_loss_zero_weight(self):
+        """Confirm z_loss_weight=0.0 is identical to baseline (no numerical drift)"""
+        for _ in range(3):
+            B, SQ = 2, 64
+            V = random.choice([64000, 128000])
+
+            inp_data = torch.rand((B, SQ, V), dtype=torch.float32, device="cuda")
+            tar = torch.randint(0, V, (B, SQ), device="cuda")
+
+            inp_baseline = inp_data.clone().detach().requires_grad_()
+            inp_zloss = inp_data.clone().detach().requires_grad_()
+
+            # Baseline: no z_loss_weight argument
+            loss_baseline = parallel_cross_entropy(
+                inp_baseline, tar, reduce_loss=True,
+            )
+            # With z_loss_weight=0.0 explicitly
+            loss_zloss = parallel_cross_entropy(
+                inp_zloss, tar, reduce_loss=True, z_loss_weight=0.0,
+            )
+
+            # Loss must be bit-identical
+            torch.testing.assert_close(loss_baseline, loss_zloss, rtol=0, atol=0)
+
+            loss_baseline.backward()
+            loss_zloss.backward()
+
+            # Gradients must be bit-identical
+            torch.testing.assert_close(
+                inp_baseline.grad, inp_zloss.grad, rtol=0, atol=0,
             )
